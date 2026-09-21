@@ -1,0 +1,151 @@
+---
+- name: AVD Session Host Patching & Post-Validation
+  hosts: all
+  gather_facts: no
+  vars:
+    api_version: "2024-04-03"
+
+  tasks:
+    # -------------------------------------------------------------------
+    # PRE-CHECK: Infrastructure Setup & Power Management
+    # -------------------------------------------------------------------
+    - name: Ensure Local Compliance Directory Exists on Control Node
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: /tmp/compliance_reports
+        state: directory
+      run_once: true
+
+    - name: Check VM Power State in Azure
+      delegate_to: localhost
+      command: >
+        az vm get-instance-view
+        --resource-group "{{ resource_group }}"
+        --name "{{ session_host_name.split('.')[0] }}"
+        --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus"
+        -o tsv
+      register: vm_power_state
+      ignore_errors: yes
+
+    - name: Power ON VM if Currently Stopped or Deallocated
+      delegate_to: localhost
+      command: >
+        az vm start
+        --resource-group "{{ resource_group }}"
+        --name "{{ session_host_name.split('.')[0] }}"
+      when: vm_power_state.stdout is defined and ('stopped' in vm_power_state.stdout.lower() or 'deallocated' in vm_power_state.stdout.lower())
+      ignore_errors: yes
+
+    - name: Ensure Host WinRM Port 5985 is Reachable
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: 5985
+        state: started
+        delay: 5
+        timeout: 600
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Check if Host Requires Pending Reboot Before Updates
+      ansible.windows.win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing
+        name: RebootPending
+      register: reboot_pending_check
+      ignore_errors: yes
+
+    - name: Reboot Host Prior to Patching if Stale Reboot Exists
+      ansible.windows.win_reboot:
+        post_reboot_delay: 30
+        reboot_timeout: 1800
+      when: reboot_pending_check.exists is defined and reboot_pending_check.exists
+      ignore_errors: yes
+
+    - name: Tag VM to Exclude from AVD Scaling Plan
+      delegate_to: localhost
+      command: >
+        az tag update --resource-id "/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ session_host_name.split('.')[0] }}"
+        --operation merge --tags MaintenanceWindow=Active
+      ignore_errors: yes
+
+    # -------------------------------------------------------------------
+    # STAGE 1: Drain Mode ON
+    # -------------------------------------------------------------------
+    - name: Enable Drain Mode on AVD Session Host
+      delegate_to: localhost
+      command: >
+        az rest --method patch
+        --url "https://management.azure.com/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.DesktopVirtualization/hostPools/{{ host_pool }}/sessionHosts/{{ session_host_name }}?api-version={{ api_version }}"
+        --body '{"properties":{"allowNewSession":false}}'
+      ignore_errors: yes
+
+    # -------------------------------------------------------------------
+    # STAGE 2: Install ALL Available Updates & Reboot
+    # -------------------------------------------------------------------
+    - name: Search, Install ALL Available Updates, and Reboot
+      ansible.windows.win_updates:
+        category_names: '*'
+        reboot: yes
+        reboot_timeout: 3600
+      register: update_result
+      ignore_errors: yes
+
+    # -------------------------------------------------------------------
+    # STAGE 3: Query Full Hotfix History and Pending Updates
+    # -------------------------------------------------------------------
+    - name: Query Complete Hotfix History & Pending Update Count
+      ansible.windows.win_shell: |
+        $Searcher = New-Object -ComObject Microsoft.Update.Searcher
+        $PendingCount = $Searcher.Search("IsInstalled=0 and Type='Software'").Updates.Count
+
+        $HotFixHistory = Get-HotFix | Sort-Object InstalledOn -Descending | 
+            Select-Object HotFixID, Description, InstalledOn, InstalledBy | 
+            Out-String -Width 4096
+
+        [PSCustomObject]@{
+            PendingUpdateCount = $PendingCount
+            HotFixHistoryTable = $HotFixHistory.Trim()
+        } | ConvertTo-Json
+      register: post_patch_validation
+      ignore_errors: yes
+
+    # -------------------------------------------------------------------
+    # STAGE 4: Append to Single Consolidated Compliance Report
+    # -------------------------------------------------------------------
+    - name: Append Host Summary to Consolidated Single Report
+      delegate_to: localhost
+      ansible.builtin.shell: |
+        cat << 'EOF' >> /tmp/compliance_reports/unified_compliance_report.txt
+        ================================================================================
+        AVD HOST COMPLIANCE REPORT
+        ================================================================================
+        Host IP: {{ inventory_hostname }}
+        SessionHostName: {{ session_host_name }}
+        Host Pool: {{ host_pool }}
+        Resource Group: {{ resource_group }}
+        Patches Applied (This Pipeline Run): {{ update_result.installed_update_count | default(0) }}
+        Pending Updates Remaining: {{ (post_patch_validation.stdout | default('{"PendingUpdateCount":"N/A"}') | from_json).PendingUpdateCount | default('N/A') }}
+        Report Timestamp: {{ lookup('pipe', 'date -u +"%Y-%m-%dT%H:%M:%SZ"') }}
+
+        HOTFIX INSTALLATION HISTORY:
+        {{ (post_patch_validation.stdout | default('{"HotFixHistoryTable":"Unable to query hotfix history"}') | from_json).HotFixHistoryTable | default('Unable to query hotfix history') }}
+        ================================================================================
+
+        EOF
+
+    # -------------------------------------------------------------------
+    # STAGE 5: Drain Mode OFF & Remove Tag
+    # -------------------------------------------------------------------
+    - name: Disable Drain Mode on AVD Session Host
+      delegate_to: localhost
+      command: >
+        az rest --method patch
+        --url "https://management.azure.com/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.DesktopVirtualization/hostPools/{{ host_pool }}/sessionHosts/{{ session_host_name }}?api-version={{ api_version }}"
+        --body '{"properties":{"allowNewSession":true}}'
+      ignore_errors: yes
+
+    - name: Remove Scaling Plan Exclusion Tag from VM
+      delegate_to: localhost
+      command: >
+        az tag update --resource-id "/subscriptions/{{ subscription_id }}/resourceGroups/{{ resource_group }}/providers/Microsoft.Compute/virtualMachines/{{ session_host_name.split('.')[0] }}"
+        --operation delete --tags MaintenanceWindow
+      ignore_errors: yes

@@ -1,0 +1,33 @@
+trigger: none
+
+pool:
+  name: "Ansible-selfagent"
+
+jobs:
+  - job: PatchingAndValidationJob
+    displayName: "Execute AVD Patching & Validation Pipeline"
+    timeoutInMinutes: 180
+    steps:
+      - script: |
+          echo "=== Initializing Report Directory ==="
+          rm -rf /tmp/compliance_reports
+          mkdir -p /tmp/compliance_reports
+
+          echo "=== Authenticating via Managed Identity ==="
+          az login --identity
+
+          echo "=== Ensuring Desktop Virtualization CLI Extension is Installed ==="
+          az extension add --name desktopvirtualization --upgrade || true
+
+          echo "=== Executing Ansible Patching Playbook ==="
+          cd "$(Build.SourcesDirectory)"
+          ansible-playbook -i inventory.ini patch.yml -f 10
+        displayName: "Run Ansible Patch & Validation Playbook"
+
+      - task: PublishPipelineArtifact@1
+        displayName: "Publish Unified Patch Compliance Artifact"
+        inputs:
+          targetPath: "/tmp/compliance_reports"
+          artifactName: "Unified-Patch-Compliance-Report"
+          publishLocation: "pipeline"
+        condition: always()
